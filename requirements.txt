@@ -1,0 +1,5 @@
+"""
+dhanhq==1.4.3
+python-telegram-bot==20.7
+asyncio
+"""
