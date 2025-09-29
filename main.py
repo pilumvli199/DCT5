@@ -1,318 +1,293 @@
 # main.py
 import os
 import asyncio
+import json
 import logging
+import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional, List
 
-# dhanhq imports (best-effort)
-try:
-    from dhanhq import DhanContext, dhanhq
-except Exception:
-    try:
-        from dhanhq import dhanhq  # type: ignore
-        DhanContext = None  # type: ignore
-    except Exception:
-        dhanhq = None  # type: ignore
-        DhanContext = None  # type: ignore
-
-import httpx
+import websockets  # pip install websockets
 from telegram import Bot
 from telegram.error import TelegramError
 
-# Logging
+# ---------- logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dhan-telegram-ws")
 
-# Environment
+# ---------- env ----------
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-    logger.error("Missing env vars. Please set DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
-    raise SystemExit("Missing env vars")
+    logger.error("Missing env vars. Set DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+    raise SystemExit("Missing required environment variables")
 
-# Dhan REST base
-DHAN_REST_BASE = "https://api.dhan.co/v2"
-MCX_REST_SEGMENT = "MCX_COMM"  # documented segment used by Dhan REST
+# ---------- WebSocket endpoint & config ----------
+WS_URL = "wss://api-feed.dhan.co"  # DhanHQ websocket endpoint (as used earlier)
+MCX_SEGMENT = "MCX_COMM"  # exchange segment to subscribe for MCX commodities
 
-# Commodities mapping (security IDs you provided). If these are wrong, enable instruments validation below.
+# Commodities mapping with security IDs (as you provided)
 COMMODITIES = {
-    "GOLD": {"security_id": 114},
-    "SILVER": {"security_id": 229},
-    "CRUDE OIL": {"security_id": 236},
-    "NATURAL GAS": {"security_id": 235},
-    "COPPER": {"security_id": 256}
+    "GOLD": 114,
+    "SILVER": 229,
+    "CRUDE OIL": 236,
+    "NATURAL GAS": 235,
+    "COPPER": 256,
 }
 
-# Toggle: validate instruments at startup (calls instruments endpoint to confirm IDs exist)
-VALIDATE_INSTRUMENTS_AT_START = True
+# subscribe list for websocket (integers)
+SECURITY_IDS: List[int] = [int(v) for v in COMMODITIES.values()]
 
-# HTTP client timeout & backoff settings
-HTTP_TIMEOUT = 10.0
-MAX_BACKOFF_RETRIES = 4
-BASE_BACKOFF_SECONDS = 1.0
+# Backoff config for reconnects
+INITIAL_BACKOFF = 1.0
+MAX_BACKOFF = 60.0
 
-# Helpers
-def _safe_float(val) -> Optional[float]:
+# Telegram send interval (seconds)
+SEND_INTERVAL = 60
+
+# ---------- Helper functions ----------
+def _safe_float(v) -> Optional[float]:
     try:
-        if val is None:
+        if v is None:
             return None
-        return float(val)
+        return float(v)
     except Exception:
         return None
 
-def format_message(prices: Dict[str, Optional[float]], last_prices: Dict[str, float]) -> str:
+def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[int, Optional[float]]) -> str:
     timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
-    message = f"📊 *Commodity Prices*\n"
-    message += f"🕒 {timestamp}\n"
-    message += "━━━━━━━━━━━━━━━━\n\n"
-    for name, price in prices.items():
+    msg = f"📊 *Commodity Prices*\n"
+    msg += f"🕒 {timestamp}\n"
+    msg += "━━━━━━━━━━━━━━━━\n\n"
+    # iterate in same order as COMMODITIES dict
+    for name, sid in COMMODITIES.items():
+        price = latest.get(sid)
         if price is None:
-            message += f"*{name}*\n_Price unavailable_\n\n"
+            msg += f"*{name}*\n_Price unavailable_\n\n"
         else:
             change = ""
-            if name in last_prices and last_prices[name] is not None:
-                diff = price - last_prices[name]
+            prev = prev_sent.get(sid)
+            if prev is not None:
+                diff = price - prev
                 if diff > 0:
                     change = f"📈 +{diff:.2f}"
                 elif diff < 0:
                     change = f"📉 {diff:.2f}"
                 else:
                     change = "➖ 0.00"
-            message += f"*{name}*\n₹ {price:.2f} {change}\n\n"
-    message += "━━━━━━━━━━━━━━━━"
-    return message
+            msg += f"*{name}*\n₹ {price:.2f} {change}\n\n"
+    msg += "━━━━━━━━━━━━━━━━"
+    return msg
 
-class DhanTelegramBot:
+# ---------- Main bot class ----------
+class DhanWebsocketTelegramBot:
     def __init__(self):
-        self.dhan = None
-        # Try instantiate library client if present (best-effort). Not necessary for REST fallback.
-        if dhanhq is not None:
-            try:
-                if 'DhanContext' in globals() and DhanContext is not None:
-                    ctx = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-                    self.dhan = dhanhq(ctx)
-                    logger.info("dhanhq client created via DhanContext")
-                else:
-                    # try common patterns
-                    try:
-                        self.dhan = dhanhq({'client_id': DHAN_CLIENT_ID, 'access_token': DHAN_ACCESS_TOKEN})
-                        logger.info("dhanhq client created via dict")
-                    except Exception:
-                        try:
-                            self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
-                            logger.info("dhanhq client created via token-only")
-                        except Exception:
-                            logger.info("dhanhq present but couldn't instantiate with known signatures")
-            except Exception as e:
-                logger.warning(f"dhanhq instantiate warning: {e}")
+        self.ws_url = WS_URL
+        self.client_id = str(DHAN_CLIENT_ID)
+        self.access_token = str(DHAN_ACCESS_TOKEN)
+        self.segment = MCX_SEGMENT
+        self.security_ids = SECURITY_IDS
 
-        # HTTPX client shared
-        self.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
-        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        # storage for latest prices {security_id: price}
+        self.latest_prices: Dict[int, Optional[float]] = {sid: None for sid in self.security_ids}
+        # previously sent prices for change calculation
+        self.prev_sent_prices: Dict[int, Optional[float]] = {}
+
+        # telegram
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
-        self.last_prices: Dict[str, Optional[float]] = {}
 
-        # local commodities structure (copy of COMMODITIES) so we can replace IDs if validation runs
-        self.commodities = {k: v.copy() for k, v in COMMODITIES.items()}
+        # control
+        self._stop = False
+        self._ws_task: Optional[asyncio.Task] = None
+        self._sender_task: Optional[asyncio.Task] = None
 
-    async def close(self):
-        await self.http_client.aclose()
+    async def start(self):
+        logger.info("Starting Dhan WebSocket -> Telegram bot")
+        # run websocket listener and sender concurrently
+        self._ws_task = asyncio.create_task(self._ws_loop())
+        self._sender_task = asyncio.create_task(self._periodic_sender())
 
-    # Optional: validate instruments by calling instruments endpoint once at startup.
-    async def validate_instruments(self):
-        """
-        Optional helper that tries to confirm the provided security_ids exist.
-        This will try a documented endpoint. If not available or fails, silently continue.
-        """
-        try:
-            # many dhanhq deployments have an instruments endpoint; this is best-effort
-            url = f"{DHAN_REST_BASE}/marketfeed/instruments"
-            headers = {
-                "accept": "application/json",
-                "access-token": DHAN_ACCESS_TOKEN,
-                "client-id": str(DHAN_CLIENT_ID)
-            }
-            # We supply the segment to narrow results - may not be supported by all accounts.
-            payload = {"segment": MCX_REST_SEGMENT}
-            resp = await self.http_client.post(url, headers=headers, json=payload)
-            if resp.status_code != 200:
-                logger.debug(f"Instruments validation non-200: {resp.status_code} {resp.text}")
-                return
-            j = resp.json()
-            data = j.get("data") or {}
-            # Data may be list or dict - do a cautious scan
-            found_ids = set()
-            if isinstance(data, list):
-                for item in data:
-                    sid = item.get("id") or item.get("security_id") or item.get("instrument_token")
-                    name = item.get("symbol") or item.get("tradingsymbol") or item.get("name")
-                    if sid is not None and name:
-                        found_ids.add(int(sid))
-            elif isinstance(data, dict):
-                # sometimes API returns id->object mapping
-                for k, v in data.items():
-                    try:
-                        found_ids.add(int(k))
-                    except Exception:
-                        pass
-            # If we found nothing, just return
-            if not found_ids:
-                logger.debug("Instruments validation: no instrument ids found in response")
-                return
-            # Compare with our list
-            for cname, meta in self.commodities.items():
-                sid = meta.get("security_id")
-                if int(sid) not in found_ids:
-                    logger.warning(f"Validated instruments: configured id {sid} for {cname} not found in instruments response")
-                else:
-                    logger.debug(f"Instrument validated: {cname} id {sid}")
-        except Exception as e:
-            logger.debug(f"Instruments validation failed: {e}")
+        # wait for tasks (they run until cancelled)
+        await asyncio.gather(self._ws_task, self._sender_task)
 
-    async def fetch_batch_ltp_rest(self, security_ids: List[int]) -> Dict[int, Optional[float]]:
-        """
-        Single batch POST to /marketfeed/ltp with payload { "MCX_COMM": [ids...] }.
-        Respects rate-limit by exponential backoff on HTTP 429.
-        Returns mapping security_id -> last_price (None if unavailable).
-        """
-        url = f"{DHAN_REST_BASE}/marketfeed/ltp"
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "access-token": DHAN_ACCESS_TOKEN,
-            "client-id": str(DHAN_CLIENT_ID)
-        }
-        payload = {MCX_REST_SEGMENT: security_ids}
-        attempt = 0
-        while attempt <= MAX_BACKOFF_RETRIES:
+    async def stop(self):
+        logger.info("Stopping bot")
+        self._stop = True
+        if self._ws_task:
+            self._ws_task.cancel()
+        if self._sender_task:
+            self._sender_task.cancel()
+
+    async def _periodic_sender(self):
+        # Wait a bit for initial prices to populate
+        await asyncio.sleep(2)
+        while not self._stop:
             try:
-                resp = await self.http_client.post(url, headers=headers, json=payload)
-            except Exception as e:
-                logger.error(f"HTTP error when calling REST LTP: {e}")
-                return {sid: None for sid in security_ids}
-            logger.info(f"REST LTP HTTP {resp.status_code} for batch ids={security_ids}")
-            if resp.status_code == 200:
-                try:
-                    j = resp.json()
-                except Exception:
-                    logger.warning("REST LTP: invalid JSON response")
-                    return {sid: None for sid in security_ids}
-                data = j.get("data") or {}
-                results: Dict[int, Optional[float]] = {}
-                seg = data.get(MCX_REST_SEGMENT) or {}
-                # seg expected to be dict of id->object
-                for sid in security_ids:
-                    sec_obj = seg.get(str(sid)) or seg.get(int(sid)) or {}
-                    if isinstance(sec_obj, dict):
-                        lp = sec_obj.get("last_price") or sec_obj.get("lastTradedPrice") or sec_obj.get("last_price")
-                        # if last_price is 0.0 treat as unavailable (common artifact)
-                        if lp is None:
-                            results[sid] = None
-                        else:
-                            f = _safe_float(lp)
-                            if f is None or f == 0.0:
-                                results[sid] = None
-                            else:
-                                results[sid] = f
-                    else:
-                        # fallback shallow scan
-                        results[sid] = None
-                logger.debug(f"REST batch parsed results: {results}")
-                return results
-            elif resp.status_code == 429:
-                # rate limited -> backoff
-                attempt += 1
-                wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(f"REST LTP rate limited (429). Backoff attempt {attempt}. Waiting {wait}s")
-                await asyncio.sleep(wait)
-                continue
-            else:
-                logger.warning(f"REST LTP non-200 response: {resp.status_code} body: {resp.text}")
-                # don't retry on other 4xx/5xx
-                return {sid: None for sid in security_ids}
-        # exhausted retries
-        logger.error("REST LTP: exhausted retries due to rate limiting")
-        return {sid: None for sid in security_ids}
-
-    async def get_all_prices(self) -> Dict[str, Optional[float]]:
-        """
-        Fetch all commodity prices in one batch call and return mapping name->price (or None).
-        """
-        # prepare list of ids
-        ids = []
-        name_for_id = {}
-        for name, meta in self.commodities.items():
-            sid = int(meta["security_id"])
-            ids.append(sid)
-            name_for_id[sid] = name
-
-        batch_result = await self.fetch_batch_ltp_rest(ids)
-
-        prices: Dict[str, Optional[float]] = {}
-        for sid in ids:
-            name = name_for_id[sid]
-            prices[name] = batch_result.get(sid)
-        return prices
-
-    async def send_telegram(self, message: str):
-        try:
-            maybe = self.telegram_bot.send_message(chat_id=self.chat_id, text=message, parse_mode="Markdown")
-            if asyncio.iscoroutine(maybe):
-                await maybe
-            logger.info(f"Message sent at {datetime.now().strftime('%I:%M:%S %p')}")
-        except TelegramError as e:
-            logger.error(f"Telegram error: {e}")
-        except Exception as e:
-            logger.error(f"Error sending telegram: {e}")
-
-    async def run(self):
-        logger.info("Bot starting...")
-
-        # optional instruments validation
-        if VALIDATE_INSTRUMENTS_AT_START:
-            await self.validate_instruments()
-
-        # initial startup message
-        try:
-            maybe = self.telegram_bot.send_message(chat_id=self.chat_id, text="✅ Bot started successfully!\n\n📊 You will receive commodity price updates every minute.")
-            if asyncio.iscoroutine(maybe):
-                await maybe
-        except Exception as e:
-            logger.warning(f"Startup Telegram message failed: {e}")
-
-        # main loop
-        while True:
-            try:
-                prices = await self.get_all_prices()
-                message = format_message(prices, self.last_prices)
-                await self.send_telegram(message)
-                # update last prices only for non-None values
-                for name, val in prices.items():
+                # build message from latest_prices and prev_sent_prices
+                message = format_telegram_message(self.latest_prices, self.prev_sent_prices)
+                await self._send_telegram(message)
+                # update prev_sent_prices only for non-None values
+                for sid, val in list(self.latest_prices.items()):
                     if val is not None:
-                        self.last_prices[name] = val
-                await asyncio.sleep(60)
-            except KeyboardInterrupt:
-                logger.info("Stopped by user")
+                        self.prev_sent_prices[sid] = val
+                await asyncio.sleep(SEND_INTERVAL)
+            except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Unexpected loop error: {e}")
-                await asyncio.sleep(10)
+                logger.error(f"Error in periodic sender: {e}")
+                await asyncio.sleep(5)
 
-# Entrypoint
-if __name__ == "__main__":
-    bot = DhanTelegramBot()
-    try:
-        asyncio.run(bot.run())
-    finally:
-        # best-effort cleanup
+    async def _send_telegram(self, message: str):
         try:
-            asyncio.run(bot.close())
-        except Exception:
-            pass
+            maybe = self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode="Markdown")
+            if asyncio.iscoroutine(maybe):
+                await maybe
+            logger.info(f"Telegram message sent at {datetime.now().strftime('%I:%M:%S %p')}")
+        except TelegramError as e:
+            logger.error(f"Telegram API error: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+
+    async def _ws_loop(self):
+        backoff = INITIAL_BACKOFF
+        while not self._stop:
+            try:
+                # connect with headers
+                headers = [
+                    ("client-id", self.client_id),
+                    ("access-token", self.access_token)
+                ]
+                logger.info(f"Connecting to WS {self.ws_url} (subscribe {self.security_ids})")
+                async with websockets.connect(self.ws_url, extra_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("WebSocket connected")
+                    backoff = INITIAL_BACKOFF  # reset backoff after successful connect
+
+                    # send subscribe message (protocol used earlier)
+                    subscribe_payload = {
+                        "msgtype": "subscribe",
+                        "exchange_segment": self.segment,
+                        "security_ids": self.security_ids
+                    }
+                    await ws.send(json.dumps(subscribe_payload))
+                    logger.info(f"Subscribed: {subscribe_payload}")
+
+                    # receive loop
+                    async for raw in ws:
+                        if raw is None:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except Exception:
+                            logger.debug(f"Received non-json WS message: {raw}")
+                            continue
+
+                        # parse known tick shapes - be permissive
+                        # sample expected keys: 'security_id', 'last_price', 'ltp', 'lastTradedPrice'
+                        sid = None
+                        # try multiple key names
+                        for k in ("security_id", "id", "instrument", "sec_id"):
+                            if k in obj:
+                                try:
+                                    sid = int(obj[k])
+                                    break
+                                except Exception:
+                                    pass
+                        # if no direct key, maybe nested under 'data' etc.
+                        if sid is None and isinstance(obj.get("data"), dict):
+                            # try to find a numeric key
+                            data = obj.get("data")
+                            for kk, vv in data.items():
+                                try:
+                                    ss = int(kk)
+                                    sid = ss
+                                    # set obj to vv for price extraction
+                                    obj = vv if isinstance(vv, dict) else obj
+                                    break
+                                except Exception:
+                                    continue
+
+                        # get price fields
+                        price = None
+                        for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                            if price_key in obj:
+                                price = _safe_float(obj.get(price_key))
+                                break
+
+                        # sometimes payload is like {"tick": {...}}
+                        if price is None and "tick" in obj and isinstance(obj["tick"], dict):
+                            tick = obj["tick"]
+                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                                if price_key in tick:
+                                    price = _safe_float(tick.get(price_key))
+                                    break
+                            if sid is None:
+                                for k in ("security_id", "id"):
+                                    if k in tick:
+                                        try:
+                                            sid = int(tick[k])
+                                        except Exception:
+                                            pass
+
+                        # fallback: if msg contains mapping of segment -> id -> {last_price:..}
+                        if sid is None and isinstance(obj, dict):
+                            for segk, segv in obj.items():
+                                if isinstance(segv, dict):
+                                    for idk, idv in segv.items():
+                                        try:
+                                            ss = int(idk)
+                                            # idv may contain price
+                                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                                                if isinstance(idv, dict) and price_key in idv:
+                                                    price = _safe_float(idv.get(price_key))
+                                                    sid = ss
+                                                    break
+                                            if sid is not None:
+                                                break
+                                        except Exception:
+                                            continue
+                                if sid is not None:
+                                    break
+
+                        # if we got sid and price, update
+                        if sid is not None and price is not None:
+                            # update only if non-zero meaningful price; keep None for missing/0
+                            if price == 0.0:
+                                # treat 0.0 as unavailable artifact (you can change this)
+                                logger.debug(f"Received 0.0 price for sid={sid}; treating as unavailable")
+                                self.latest_prices[sid] = None
+                            else:
+                                self.latest_prices[sid] = price
+                                logger.debug(f"Updated price sid={sid} price={price}")
+                        else:
+                            # log for debugging occasionally
+                            logger.debug(f"WS msg no price parsed: {obj}")
+
+            except asyncio.CancelledError:
+                logger.info("Websocket loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"WebSocket connection error: {e}")
+                # backoff before reconnect
+                logger.info(f"Reconnecting after {backoff:.1f}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+
+# ---------- Entrypoint ----------
+if __name__ == "__main__":
+    bot = DhanWebsocketTelegramBot()
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user — exiting")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+    finally:
+        logger.info("Bot stopped")
