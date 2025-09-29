@@ -15,6 +15,9 @@ except Exception:
         dhanhq = None  # type: ignore
         DhanContext = None  # type: ignore
 
+# httpx for REST fallback
+import httpx
+
 # Telegram
 from telegram import Bot
 from telegram.error import TelegramError
@@ -54,7 +57,9 @@ def _get_exchange_constant(module, name):
         pass
     return name
 
-MCX_CONST = _get_exchange_constant(dhanhq, "MCX")
+# Use documented MCX segment name for REST (Annexure says: MCX_COMM)
+MCX_REST_SEGMENT = "MCX_COMM"
+MCX_CONST = _get_exchange_constant(dhanhq, "MCX")  # for client lib usage (if present)
 
 COMMODITIES = {
     "GOLD": {"exchange": MCX_CONST, "security_id": "114"},
@@ -64,6 +69,9 @@ COMMODITIES = {
     "COPPER": {"exchange": MCX_CONST, "security_id": "256"}
 }
 
+# REST base
+DHAN_REST_BASE = "https://api.dhan.co/v2"
+
 class DhanTelegramBot:
     def __init__(self):
         if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
@@ -71,42 +79,41 @@ class DhanTelegramBot:
 
         self.dhan = None
         if dhanhq is None:
-            logger.error("dhanhq package not available. Check requirements.txt and installed packages.")
-            raise ImportError("dhanhq package not found")
+            logger.warning("dhanhq package not available or import failed. Will use REST fallback.")
 
-        # Try multiple instantiation patterns for dhanhq
-        if 'DhanContext' in globals() and DhanContext is not None:
-            try:
-                dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-                self.dhan = dhanhq(dhan_context)
-                logger.info("dhanhq client created using DhanContext(dhan_client_id, access_token)")
-            except Exception as e:
-                logger.warning(f"DhanContext path failed: {e}")
+        # Try multiple instantiation patterns for dhanhq (if package present)
+        if dhanhq is not None:
+            if 'DhanContext' in globals() and DhanContext is not None:
+                try:
+                    dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                    self.dhan = dhanhq(dhan_context)
+                    logger.info("dhanhq client created using DhanContext(dhan_client_id, access_token)")
+                except Exception as e:
+                    logger.debug(f"DhanContext path failed: {e}")
 
-        if self.dhan is None:
-            try:
-                self.dhan = dhanhq({'client_id': DHAN_CLIENT_ID, 'access_token': DHAN_ACCESS_TOKEN})
-                logger.info("dhanhq client created using dict config")
-            except Exception as e:
-                logger.debug(f"dict-config attempt failed: {e}")
+            if self.dhan is None:
+                try:
+                    self.dhan = dhanhq({'client_id': DHAN_CLIENT_ID, 'access_token': DHAN_ACCESS_TOKEN})
+                    logger.info("dhanhq client created using dict config")
+                except Exception as e:
+                    logger.debug(f"dict-config attempt failed: {e}")
 
-        if self.dhan is None:
-            try:
-                self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
-                logger.info("dhanhq client created using access token only")
-            except Exception as e:
-                logger.debug(f"access-token attempt failed: {e}")
+            if self.dhan is None:
+                try:
+                    self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
+                    logger.info("dhanhq client created using access token only")
+                except Exception as e:
+                    logger.debug(f"access-token attempt failed: {e}")
 
-        if self.dhan is None:
-            try:
-                self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-                logger.info("dhanhq client created using (client_id, access_token)")
-            except Exception as e:
-                logger.debug(f"(client_id, access_token) attempt failed: {e}")
+            if self.dhan is None:
+                try:
+                    self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+                    logger.info("dhanhq client created using (client_id, access_token)")
+                except Exception as e:
+                    logger.debug(f"(client_id, access_token) attempt failed: {e}")
 
-        if self.dhan is None:
-            logger.error("Failed to instantiate dhanhq client with any known signature. Check dhanhq version and docs.")
-            raise RuntimeError("dhanhq instantiation failed")
+            if self.dhan is None:
+                logger.info("dhanhq is present but unable to instantiate with known patterns; REST fallback will be used.")
 
         # Telegram bot
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -114,129 +121,162 @@ class DhanTelegramBot:
         self.last_prices = {}
         logger.info("Bot initialized successfully")
 
-    async def _try_call(self, label, func, *args, **kwargs):
-        """Helper that tries calling func, awaits if coroutine, logs result and returns it or None."""
+    # -------------------------
+    # REST fallback: fetch LTP from Dhan API directly
+    # -------------------------
+    async def fetch_ltp_via_rest(self, security_id):
+        """
+        Call POST /marketfeed/ltp with JSON body { "MCX_COMM": [security_id] }
+        Headers required: access-token, client-id
+        """
+        url = f"{DHAN_REST_BASE}/marketfeed/ltp"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "access-token": DHAN_ACCESS_TOKEN,
+            "client-id": str(DHAN_CLIENT_ID)
+        }
+        payload = {MCX_REST_SEGMENT: [int(security_id)]}  # docs expect integer security IDs in list
+
         try:
-            result = func(*args, **kwargs) if callable(func) else None
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                logger.info(f"REST LTP HTTP {resp.status_code} for security_id={security_id}")
+                if resp.status_code != 200:
+                    logger.warning(f"REST LTP non-200 response: {resp.status_code} body: {resp.text}")
+                    return None
+                j = resp.json()
+                logger.debug(f"REST LTP raw json for {security_id}: {j}")
+                # docs show response: {"data": {"MCX_COMM": {"<id>": {"last_price": 123.45}}}, "status":"success"}
+                data = j.get("data") or {}
+                seg = data.get(MCX_REST_SEGMENT) or {}
+                sec_obj = seg.get(str(security_id)) or seg.get(int(security_id)) or {}
+                if isinstance(sec_obj, dict):
+                    lp = sec_obj.get("last_price") or sec_obj.get("last_price")
+                    if lp is None:
+                        # sometimes they nest as {"114": {"last_price": 123}} or {"MCX_COMM": {"114": {"last_price":123}}}
+                        # Already tried above; fallback: shallow scan
+                        for v in sec_obj.values():
+                            if isinstance(v, (int, float)):
+                                return float(v)
+                    return _safe_float(lp)
+                # fallback shallow search
+                if isinstance(data, dict):
+                    for segk, segv in data.items():
+                        if isinstance(segv, dict) and str(security_id) in segv:
+                            lp = segv[str(security_id)].get("last_price")
+                            if lp is not None:
+                                return _safe_float(lp)
+                return None
         except Exception as e:
-            logger.debug(f"LTP attempt {label} raised exception during call: {e}")
-            result = None
+            logger.error(f"REST LTP fetch error for {security_id}: {e}")
+            return None
 
-        # If function returned a callable (rare), call it
-        if callable(result) and not asyncio.iscoroutine(result):
-            try:
-                result = result()
-            except Exception as e:
-                logger.debug(f"LTP attempt {label} inner call failed: {e}")
-                result = None
-
-        if asyncio.iscoroutine(result):
-            try:
-                result = await result
-            except Exception as e:
-                logger.debug(f"LTP attempt {label} awaiting failed: {e}")
-                result = None
-
-        # log raw
-        logger.info(f"LTP attempt {label} raw response: {result}")
-        return result
-
-    async def get_ltp(self, security_id, exchange):
+    # -------------------------
+    # attempt using dhanhq client (if available) - tolerant to shapes
+    # -------------------------
+    async def get_ltp_from_client(self, security_id, exchange):
         """
-        Very aggressive LTP fetcher:
-        Tries a sequence of likely methods/signatures and logs every attempt.
+        Attempts multiple common client calls to fetch LTP (synchronous or coroutine).
+        Returns float LTP or None.
         """
+        if self.dhan is None:
+            return None
+
+        # try a few likely attributes/methods
+        attempts = []
+
         try:
-            attempts = []
-            idx = 0
+            mf = getattr(self.dhan, "marketfeed", None)
+            if mf:
+                attempts.append(lambda: mf.get_ltp(exchange_segment=exchange, security_id=security_id))
+                attempts.append(lambda: mf.get_ltp(exchange=exchange, security_id=security_id))
+                attempts.append(lambda: mf.get_quote(exchange_segment=exchange, security_id=security_id))
+                attempts.append(lambda: mf.get_snapshot(exchange, security_id))
+        except Exception:
+            pass
 
-            # 1) marketfeed.get_ltp(exchange_segment=..., security_id=...)
+        # top-level helpers
+        for name in ("get_ltp", "getQuote", "get_quote", "ltp", "get_instruments_ltp", "getInstrumentLTP"):
+            fn = getattr(self.dhan, name, None)
+            if callable(fn):
+                attempts.append(lambda fn=fn: fn(exchange, security_id))
+
+        # market.* variations
+        market = getattr(self.dhan, "market", None)
+        if market:
+            attempts.append(lambda: market.get_ltp(exchange, security_id))
+            attempts.append(lambda: market.get_quote(exchange, security_id))
+
+        for attempt_fn in attempts:
             try:
-                mf = getattr(self.dhan, "marketfeed", None)
-                if mf:
-                    attempts.append(("marketfeed.get_ltp(exchange_segment,security_id)",
-                                     lambda: mf.get_ltp(exchange_segment=exchange, security_id=security_id)))
-                    attempts.append(("marketfeed.get_ltp(exchange,security_id)",
-                                     lambda: mf.get_ltp(exchange=exchange, security_id=security_id)))
-                    attempts.append(("marketfeed.get_quote(exchange_segment,security_id)",
-                                     lambda: mf.get_quote(exchange_segment=exchange, security_id=security_id)))
-            except Exception:
-                pass
+                res = attempt_fn()
+            except Exception as e:
+                logger.debug(f"Client attempt raised: {e}")
+                res = None
 
-            # 2) top-level helpers
-            for name in ("get_ltp", "getQuote", "get_quote", "ltp", "get_instruments_ltp", "getInstrumentLTP"):
-                if hasattr(self.dhan, name):
-                    fn = getattr(self.dhan, name)
-                    attempts.append((f"top.{name}(exchange,security_id)", lambda fn=fn: fn(exchange, security_id)))
+            # await if coroutine
+            if asyncio.iscoroutine(res):
+                try:
+                    res = await res
+                except Exception as e:
+                    logger.debug(f"Awaiting client attempt failed: {e}")
+                    res = None
 
-            # 3) some libs expose dhanhq.market.get_ltp
-            try:
-                market = getattr(self.dhan, "market", None)
-                if market:
-                    attempts.append(("market.get_ltp(exchange,security_id)", lambda: market.get_ltp(exchange, security_id)))
-                    attempts.append(("market.get_quote(exchange,security_id)", lambda: market.get_quote(exchange, security_id)))
-            except Exception:
-                pass
+            logger.debug(f"Client attempt raw response for {security_id}: {res}")
 
-            # 4) try dhanhq.marketfeed.get_snapshot or similar
-            try:
-                if mf:
-                    attempts.append(("marketfeed.get_snapshot(exchange,security_id)", lambda: mf.get_snapshot(exchange, security_id)))
-            except Exception:
-                pass
-
-            # 5) last-resort: try call to .marketfeed (callable) if it's callable
-            if callable(getattr(self.dhan, "marketfeed", None)):
-                attempts.append(("dhan.marketfeed()", lambda: self.dhan.marketfeed()))
-
-            # iterate attempts and return first parsable numeric LTP
-            for label, func in attempts:
-                idx += 1
-                resp = await self._try_call(f"{idx} {label}", func)
-                # parse common shapes
-                if resp is None:
-                    continue
-                # common dict shapes with 'data'
-                if isinstance(resp, dict) and 'data' in resp:
-                    d = resp['data']
-                    if isinstance(d, dict):
-                        val = _safe_float(d.get('LTP') or d.get('ltp') or d.get('last_price') or d.get('lastTradedPrice') or d.get('lastTraded'))
-                        if val is not None:
-                            return val
-                    elif isinstance(d, list) and d:
-                        item = d[0]
-                        if isinstance(item, dict):
-                            val = _safe_float(item.get('LTP') or item.get('ltp') or item.get('last_price') or item.get('lastTradedPrice'))
-                            if val is not None:
-                                return val
-                if isinstance(resp, dict):
-                    val = _safe_float(resp.get('LTP') or resp.get('ltp') or resp.get('last_price') or resp.get('lastTradedPrice') or resp.get('lastTraded'))
-                    if val is not None:
-                        return val
-                if isinstance(resp, (int, float)):
-                    return float(resp)
-                # attribute objects
-                for attr in ("LTP", "ltp", "last_price", "lastTradedPrice", "lastTraded"):
-                    if hasattr(resp, attr):
-                        val = _safe_float(getattr(resp, attr))
-                        if val is not None:
-                            return val
-                # if resp contains nested dicts, do a shallow search for numeric-like values
-                if isinstance(resp, dict):
-                    for k, v in resp.items():
+            # parse common shapes:
+            if res is None:
+                continue
+            if isinstance(res, dict) and 'data' in res:
+                d = res['data']
+                # try nested shapes
+                if isinstance(d, dict):
+                    # If data contains segment -> id -> {'last_price': ..}
+                    for segk, segv in d.items():
+                        if isinstance(segv, dict) and str(security_id) in segv:
+                            lp = segv[str(security_id)].get("last_price")
+                            if lp is not None:
+                                return _safe_float(lp)
+                    # if 'LTP' directly inside
+                    for k, v in d.items():
                         if isinstance(v, (int, float)):
                             return float(v)
-                        if isinstance(v, str) and v.replace('.', '', 1).isdigit():
-                            return _safe_float(v)
-                # otherwise continue to next attempt
+                # If data itself is a dict with 'last_price'
+                lp = d.get("last_price") if isinstance(d, dict) else None
+                if lp is not None:
+                    return _safe_float(lp)
+            if isinstance(res, dict):
+                lp = res.get("last_price") or res.get("LTP") or res.get("ltp")
+                if lp is not None:
+                    return _safe_float(lp)
+            if isinstance(res, (int, float)):
+                return float(res)
+            # object attributes
+            for attr in ("last_price", "LTP", "ltp"):
+                if hasattr(res, attr):
+                    return _safe_float(getattr(res, attr))
+        return None
 
-            # if none of attempts returned
-            logger.warning(f"No parsable LTP found for security_id={security_id}")
-            return None
-
+    # unified get_ltp: try client then REST fallback
+    async def get_ltp(self, security_id, exchange):
+        # try client first
+        try:
+            lp = await self.get_ltp_from_client(security_id, exchange)
+            if lp is not None:
+                logger.info(f"LTP from client for {security_id}: {lp}")
+                return lp
         except Exception as e:
-            logger.error(f"Error in get_ltp for {security_id}: {e}")
-            return None
+            logger.debug(f"Client get_ltp raised: {e}")
+
+        # REST fallback
+        lp = await self.fetch_ltp_via_rest(security_id)
+        if lp is not None:
+            logger.info(f"LTP from REST for {security_id}: {lp}")
+            return lp
+
+        logger.warning(f"No LTP found for security_id={security_id}")
+        return None
 
     async def format_message(self, prices):
         timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
