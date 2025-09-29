@@ -54,7 +54,6 @@ def _get_exchange_constant(module, name):
         pass
     return name
 
-# Commodity config (MCX)
 MCX_CONST = _get_exchange_constant(dhanhq, "MCX")
 
 COMMODITIES = {
@@ -76,7 +75,6 @@ class DhanTelegramBot:
             raise ImportError("dhanhq package not found")
 
         # Try multiple instantiation patterns for dhanhq
-        # 1) DhanContext -> dhanhq(DhanContext)
         if 'DhanContext' in globals() and DhanContext is not None:
             try:
                 dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
@@ -85,7 +83,6 @@ class DhanTelegramBot:
             except Exception as e:
                 logger.warning(f"DhanContext path failed: {e}")
 
-        # 2) dict config
         if self.dhan is None:
             try:
                 self.dhan = dhanhq({'client_id': DHAN_CLIENT_ID, 'access_token': DHAN_ACCESS_TOKEN})
@@ -93,7 +90,6 @@ class DhanTelegramBot:
             except Exception as e:
                 logger.debug(f"dict-config attempt failed: {e}")
 
-        # 3) access token only
         if self.dhan is None:
             try:
                 self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
@@ -101,7 +97,6 @@ class DhanTelegramBot:
             except Exception as e:
                 logger.debug(f"access-token attempt failed: {e}")
 
-        # 4) old two-arg signature
         if self.dhan is None:
             try:
                 self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
@@ -119,77 +114,128 @@ class DhanTelegramBot:
         self.last_prices = {}
         logger.info("Bot initialized successfully")
 
+    async def _try_call(self, label, func, *args, **kwargs):
+        """Helper that tries calling func, awaits if coroutine, logs result and returns it or None."""
+        try:
+            result = func(*args, **kwargs) if callable(func) else None
+        except Exception as e:
+            logger.debug(f"LTP attempt {label} raised exception during call: {e}")
+            result = None
+
+        # If function returned a callable (rare), call it
+        if callable(result) and not asyncio.iscoroutine(result):
+            try:
+                result = result()
+            except Exception as e:
+                logger.debug(f"LTP attempt {label} inner call failed: {e}")
+                result = None
+
+        if asyncio.iscoroutine(result):
+            try:
+                result = await result
+            except Exception as e:
+                logger.debug(f"LTP attempt {label} awaiting failed: {e}")
+                result = None
+
+        # log raw
+        logger.info(f"LTP attempt {label} raw response: {result}")
+        return result
+
     async def get_ltp(self, security_id, exchange):
         """
-        Get Latest Traded Price from DhanHQ (tolerant + debug).
-        This function will log the raw response for debugging.
+        Very aggressive LTP fetcher:
+        Tries a sequence of likely methods/signatures and logs every attempt.
         """
         try:
-            response = None
+            attempts = []
+            idx = 0
 
-            # Try common synchronous call signatures first
+            # 1) marketfeed.get_ltp(exchange_segment=..., security_id=...)
             try:
-                response = self.dhan.marketfeed.get_ltp(
-                    exchange_segment=exchange,
-                    security_id=security_id
-                )
-            except Exception as e:
-                logger.debug(f"marketfeed.get_ltp(exchange_segment=..., security_id=...) failed for {security_id}: {e}")
-                try:
-                    response = self.dhan.marketfeed.get_ltp(
-                        exchange=exchange,
-                        security_id=security_id
-                    )
-                except Exception as e2:
-                    logger.debug(f"marketfeed.get_ltp(exchange=..., security_id=...) failed for {security_id}: {e2}")
-                    # maybe client exposes a direct method
-                    try:
-                        response = getattr(self.dhan, "get_ltp", None)
-                        if callable(response):
-                            response = response(exchange, security_id)
-                        else:
-                            response = None
-                    except Exception as e3:
-                        logger.debug(f"fallback get_ltp call failed: {e3}")
-                        response = None
+                mf = getattr(self.dhan, "marketfeed", None)
+                if mf:
+                    attempts.append(("marketfeed.get_ltp(exchange_segment,security_id)",
+                                     lambda: mf.get_ltp(exchange_segment=exchange, security_id=security_id)))
+                    attempts.append(("marketfeed.get_ltp(exchange,security_id)",
+                                     lambda: mf.get_ltp(exchange=exchange, security_id=security_id)))
+                    attempts.append(("marketfeed.get_quote(exchange_segment,security_id)",
+                                     lambda: mf.get_quote(exchange_segment=exchange, security_id=security_id)))
+            except Exception:
+                pass
 
-            # If coroutine was returned, await it
-            if asyncio.iscoroutine(response):
-                response = await response
+            # 2) top-level helpers
+            for name in ("get_ltp", "getQuote", "get_quote", "ltp", "get_instruments_ltp", "getInstrumentLTP"):
+                if hasattr(self.dhan, name):
+                    fn = getattr(self.dhan, name)
+                    attempts.append((f"top.{name}(exchange,security_id)", lambda fn=fn: fn(exchange, security_id)))
 
-            # DEBUG: log raw response so we can adapt parser
-            logger.info(f"LTP raw response for {security_id}: {response}")
+            # 3) some libs expose dhanhq.market.get_ltp
+            try:
+                market = getattr(self.dhan, "market", None)
+                if market:
+                    attempts.append(("market.get_ltp(exchange,security_id)", lambda: market.get_ltp(exchange, security_id)))
+                    attempts.append(("market.get_quote(exchange,security_id)", lambda: market.get_quote(exchange, security_id)))
+            except Exception:
+                pass
 
-            if response is None:
-                return None
+            # 4) try dhanhq.marketfeed.get_snapshot or similar
+            try:
+                if mf:
+                    attempts.append(("marketfeed.get_snapshot(exchange,security_id)", lambda: mf.get_snapshot(exchange, security_id)))
+            except Exception:
+                pass
 
-            # Common shapes:
-            # {'data': {...}} or {'data': [{...}]}
-            if isinstance(response, dict) and 'data' in response:
-                ltp_data = response['data']
-                if isinstance(ltp_data, dict):
-                    return _safe_float(ltp_data.get('LTP') or ltp_data.get('last_price') or ltp_data.get('ltp') or ltp_data.get('lastTradedPrice'))
-                elif isinstance(ltp_data, list) and len(ltp_data) > 0:
-                    item = ltp_data[0]
-                    if isinstance(item, dict):
-                        return _safe_float(item.get('LTP') or item.get('last_price') or item.get('ltp') or item.get('lastTradedPrice'))
-            # Direct dict with LTP
-            if isinstance(response, dict) and ('LTP' in response or 'ltp' in response or 'last_price' in response or 'lastTradedPrice' in response):
-                return _safe_float(response.get('LTP') or response.get('ltp') or response.get('last_price') or response.get('lastTradedPrice'))
-            # Numeric
-            if isinstance(response, (int, float)):
-                return float(response)
-            # Object attributes
-            if hasattr(response, 'LTP'):
-                return _safe_float(getattr(response, 'LTP'))
-            if hasattr(response, 'ltp'):
-                return _safe_float(getattr(response, 'ltp'))
-            if hasattr(response, 'last_price'):
-                return _safe_float(getattr(response, 'last_price'))
-            # Unknown shape
+            # 5) last-resort: try call to .marketfeed (callable) if it's callable
+            if callable(getattr(self.dhan, "marketfeed", None)):
+                attempts.append(("dhan.marketfeed()", lambda: self.dhan.marketfeed()))
+
+            # iterate attempts and return first parsable numeric LTP
+            for label, func in attempts:
+                idx += 1
+                resp = await self._try_call(f"{idx} {label}", func)
+                # parse common shapes
+                if resp is None:
+                    continue
+                # common dict shapes with 'data'
+                if isinstance(resp, dict) and 'data' in resp:
+                    d = resp['data']
+                    if isinstance(d, dict):
+                        val = _safe_float(d.get('LTP') or d.get('ltp') or d.get('last_price') or d.get('lastTradedPrice') or d.get('lastTraded'))
+                        if val is not None:
+                            return val
+                    elif isinstance(d, list) and d:
+                        item = d[0]
+                        if isinstance(item, dict):
+                            val = _safe_float(item.get('LTP') or item.get('ltp') or item.get('last_price') or item.get('lastTradedPrice'))
+                            if val is not None:
+                                return val
+                if isinstance(resp, dict):
+                    val = _safe_float(resp.get('LTP') or resp.get('ltp') or resp.get('last_price') or resp.get('lastTradedPrice') or resp.get('lastTraded'))
+                    if val is not None:
+                        return val
+                if isinstance(resp, (int, float)):
+                    return float(resp)
+                # attribute objects
+                for attr in ("LTP", "ltp", "last_price", "lastTradedPrice", "lastTraded"):
+                    if hasattr(resp, attr):
+                        val = _safe_float(getattr(resp, attr))
+                        if val is not None:
+                            return val
+                # if resp contains nested dicts, do a shallow search for numeric-like values
+                if isinstance(resp, dict):
+                    for k, v in resp.items():
+                        if isinstance(v, (int, float)):
+                            return float(v)
+                        if isinstance(v, str) and v.replace('.', '', 1).isdigit():
+                            return _safe_float(v)
+                # otherwise continue to next attempt
+
+            # if none of attempts returned
+            logger.warning(f"No parsable LTP found for security_id={security_id}")
             return None
+
         except Exception as e:
-            logger.error(f"Error fetching LTP for {security_id}: {e}")
+            logger.error(f"Error in get_ltp for {security_id}: {e}")
             return None
 
     async def format_message(self, prices):
@@ -235,14 +281,8 @@ class DhanTelegramBot:
     async def fetch_all_prices(self):
         prices = {}
         for name, details in COMMODITIES.items():
-            ltp = await self.get_ltp(
-                details['security_id'],
-                details['exchange']
-            )
-            prices[name] = {
-                'price': ltp,
-                'exchange': details['exchange']
-            }
+            ltp = await self.get_ltp(details['security_id'], details['exchange'])
+            prices[name] = {'price': ltp, 'exchange': details['exchange']}
             await asyncio.sleep(0.5)
         return prices
 
