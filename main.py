@@ -1,15 +1,19 @@
 # main.py
 """
-DhanHQ WebSocket -> Telegram bot with:
-- instruments refresh (REST best-effort)
+DhanHQ WebSocket -> Telegram bot
+Features:
+- CSV-based instrument discovery (api-scrip-master-detailed.csv)
 - front-month auto-pick per commodity
-- automatic re-subscribe (reconnect) when mapping changes
+- automatic re-subscribe when mapping changes
 - fallback: persist last-good prices to disk
+- WebSocket real-time ticks and periodic Telegram summary
 """
 import os
 import asyncio
 import json
 import logging
+import csv
+from io import StringIO
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Any
 
@@ -36,27 +40,24 @@ if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT
     raise SystemExit("Missing required environment variables")
 
 # ---------- Config ----------
-# WebSocket base and query-template (per Dhan docs / earlier working handshake)
 WS_BASE = "wss://api-feed.dhan.co"
 WS_QUERY_TEMPLATE = "?version=2&token={token}&clientId={clientId}&authType=2"
 
-# REST base for instrument discovery / fallback
-DHAN_REST_BASE = "https://api.dhan.co/v2"
+CSV_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
-# segment used for MCX commodity instruments
+DHAN_REST_BASE = "https://api.dhan.co/v2"
 MCX_SEGMENT = "MCX_COMM"
 
-# Commodities (underlying names) - we will auto-pick front-month contract for each
+# Underlying names used to match CSV/tradingsymbol
 COMMODITY_UNDERLYINGS = {
     "GOLD": "GOLD",
     "SILVER": "SILVER",
-    "CRUDE OIL": "CRUDEOIL",      # sometimes symbol naming differs; we'll match case-insensitive substring
+    "CRUDE OIL": "CRUDEOIL",
     "NATURAL GAS": "NATURALGAS",
     "COPPER": "COPPER"
 }
 
-# If REST instruments endpoint not available on your account, code falls back to the current/default security IDs below.
-# These are initial defaults — they'll be replaced by instrument discovery if possible.
+# Initial fallback security IDs (will be replaced by discovery if possible)
 INITIAL_SECURITY_IDS = {
     "GOLD": 114,
     "SILVER": 229,
@@ -65,14 +66,12 @@ INITIAL_SECURITY_IDS = {
     "COPPER": 256
 }
 
-# Backoff & intervals
+# Intervals and files
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
-SEND_INTERVAL = int(os.getenv("SEND_INTERVAL", "60"))          # Telegram summary interval (seconds)
-REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3600"))  # Instrument discovery interval (seconds)
-CACHE_FILE = os.getenv("LAST_PRICE_CACHE", "last_prices.json") # path to persist last-good prices
-
-# Rate limiting tolerance for REST calls
+SEND_INTERVAL = int(os.getenv("SEND_INTERVAL", "60"))      # seconds
+REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3600"))  # seconds
+CACHE_FILE = os.getenv("LAST_PRICE_CACHE", "last_prices.json")
 HTTP_TIMEOUT = 10.0
 
 # ---------- Helpers ----------
@@ -92,7 +91,7 @@ def save_cache(path: str, data: Dict[str, Any]):
         with open(path, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        logger.warning(f"Failed to save cache {path}: {e}")
+        logger.debug(f"Failed to save cache {path}: {e}")
 
 def load_cache(path: str) -> Dict[str, Any]:
     try:
@@ -101,7 +100,7 @@ def load_cache(path: str) -> Dict[str, Any]:
         with open(path, "r") as f:
             return json.load(f)
     except Exception as e:
-        logger.warning(f"Failed to load cache {path}: {e}")
+        logger.debug(f"Failed to load cache {path}: {e}")
         return {}
 
 def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[int, Optional[float]], mapping: Dict[str, int]) -> str:
@@ -109,7 +108,6 @@ def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[
     msg = f"📊 *Commodity Prices*\n"
     msg += f"🕒 {timestamp}\n"
     msg += "━━━━━━━━━━━━━━━━\n\n"
-    # iterate in stable order
     for cname in COMMODITY_UNDERLYINGS.keys():
         sid = mapping.get(cname)
         price = latest.get(sid) if sid is not None else None
@@ -130,72 +128,47 @@ def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[
     msg += "━━━━━━━━━━━━━━━━"
     return msg
 
-# ---------- Instrument discovery & pick front-month ----------
-async def fetch_instruments_rest(client: httpx.AsyncClient, segment: str) -> List[Dict[str, Any]]:
+# ---------- CSV-based instrument discovery ----------
+async def fetch_instruments_from_csv(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """
-    Best-effort REST call to fetch instruments for a given segment.
-    Endpoint may be unavailable for some accounts (404) — function handles gracefully.
+    Download Dhan scrip-master CSV and parse rows into list of dicts.
+    Returns [] on error.
     """
-    url = f"{DHAN_REST_BASE}/marketfeed/instruments"
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json",
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": str(DHAN_CLIENT_ID)
-    }
-    payload = {"segment": segment}
     try:
-        resp = await client.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+        resp = await client.get(CSV_MASTER_URL, timeout=15.0)
     except Exception as e:
-        logger.debug(f"fetch_instruments_rest HTTP error: {e}")
+        logger.warning(f"CSV fetch failed: {e}")
         return []
     if resp.status_code != 200:
-        logger.info(f"fetch_instruments_rest: non-200 {resp.status_code} {resp.text[:200]}")
+        logger.warning(f"CSV fetch non-200: {resp.status_code}")
         return []
-    try:
-        j = resp.json()
-    except Exception:
-        logger.debug("fetch_instruments_rest: invalid json")
+    text = resp.text
+    if not text:
         return []
-    data = j.get("data") or []
-    # data may be dict or list; normalize to list of objects
-    if isinstance(data, dict):
-        # dict mapping id -> obj
-        items = []
-        for k, v in data.items():
-            try:
-                if isinstance(v, dict):
-                    v = v.copy()
-                    v["id"] = int(k)
-                    items.append(v)
-            except Exception:
-                continue
-        return items
-    elif isinstance(data, list):
-        return data
-    else:
-        return []
+    f = StringIO(text)
+    reader = csv.DictReader(f)
+    items = []
+    for row in reader:
+        # normalize keys/values
+        norm = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+        items.append(norm)
+    logger.info(f"Fetched {len(items)} instruments from CSV")
+    return items
 
 def parse_instrument_expiry(inst: Dict[str, Any]) -> Optional[datetime]:
-    # Try common fields: 'expiry', 'expiry_date', 'expiry_dt' - various formats
-    for f in ("expiry", "expiry_date", "expiry_dt", "exp_date"):
+    for f in ("expiry", "expiry_date", "expiry_dt", "exp_date", "contract_expiry"):
         v = inst.get(f)
         if not v:
             continue
-        # try iso parse
         try:
-            # allow date-only or datetime
-            if isinstance(v, (int, float)):
-                # some APIs pass epoch ms
-                return datetime.fromtimestamp(int(v)/1000, tz=timezone.utc)
-            txt = str(v)
-            # try common patterns
+            txt = str(v).strip()
+            # try ISO
             try:
                 return datetime.fromisoformat(txt)
             except Exception:
-                # fallback: try yyyy-mm-dd
-                from datetime import datetime as dt
+                # try YYYY-MM-DD
                 try:
+                    from datetime import datetime as dt
                     return dt.strptime(txt, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 except Exception:
                     pass
@@ -204,89 +177,72 @@ def parse_instrument_expiry(inst: Dict[str, Any]) -> Optional[datetime]:
     return None
 
 def matches_underlying(inst: Dict[str, Any], underlying: str) -> bool:
-    """
-    Determine if instrument object corresponds to underlying symbol.
-    We check fields like 'symbol', 'tradingsymbol', 'name'.
-    Use case-insensitive substring match as heuristic.
-    """
-    keys = ["symbol", "tradingsymbol", "name", "instrument_name"]
-    u = underlying.lower()
+    keys = ["symbol", "tradingsymbol", "name", "instrument_name", "instrument"]
+    u = underlying.lower().replace(" ", "")
     for k in keys:
         v = inst.get(k)
         if v and u in str(v).lower().replace(" ", ""):
             return True
-    # fallback check attributes
+    # fallback: join some fields
     txt = " ".join(str(inst.get(k, "")).lower() for k in keys)
     if u in txt.replace(" ", ""):
         return True
     return False
 
 def pick_front_month(instruments: List[Dict[str, Any]], underlying: str) -> Optional[Dict[str, Any]]:
-    """
-    Pick nearest future (front-month) instrument for an underlying symbol.
-    Returns the instrument dict or None.
-    """
     candidates = []
     for inst in instruments:
         try:
             if matches_underlying(inst, underlying):
                 exp = parse_instrument_expiry(inst)
-                # only include future expiries
                 if exp is not None and exp > datetime.now(timezone.utc):
                     candidates.append((exp, inst))
                 else:
-                    # sometimes expiry not provided; include with None expiry as fallback later
                     candidates.append((None, inst))
         except Exception:
             continue
-    # prefer those with expiries and nearest expiry
     with_expiry = [c for c in candidates if c[0] is not None]
     if with_expiry:
         with_expiry.sort(key=lambda x: x[0])
         return with_expiry[0][1]
-    # otherwise fallback to first candidate (if any)
     if candidates:
         return candidates[0][1]
     return None
 
-# ---------- Main bot class ----------
+# ---------- Main bot ----------
 class DhanWebsocketTelegramBot:
     def __init__(self):
-        # initial mapping from commodity name -> security_id (int)
+        # mapping commodity name -> security_id
         self.mapping: Dict[str, int] = INITIAL_SECURITY_IDS.copy()
-        # reverse mapping used for quick lookups
         self.current_security_ids: List[int] = [int(v) for v in self.mapping.values()]
 
-        # latest prices keyed by security_id -> float|None
+        # latest & prev prices keyed by security_id
         self.latest_prices: Dict[int, Optional[float]] = {}
-        # prev sent snapshot for change calculation
         self.prev_sent_prices: Dict[int, Optional[float]] = {}
 
-        # load persisted last-good prices (fallback)
+        # load cache
         cache = load_cache(CACHE_FILE)
         persisted = cache.get("last_prices", {})
-        # persisted keyed by str(sid) -> price
         for cname, sid in self.mapping.items():
             sid_int = int(sid)
             p = persisted.get(str(sid_int))
             self.latest_prices[sid_int] = _safe_float(p) if p is not None else None
             self.prev_sent_prices[sid_int] = _safe_float(p) if p is not None else None
 
-        # ws state
+        # WS & HTTP client
         self.ws_base = WS_BASE
         self.token = DHAN_ACCESS_TOKEN
         self.client_id = str(DHAN_CLIENT_ID)
         self.segment = MCX_SEGMENT
 
-        self._ws = None  # active websocket handle (context-managed)
-        self._ws_lock = asyncio.Lock()  # protect ws handle
+        self._ws = None
+        self._ws_lock = asyncio.Lock()
         self._reconnect = asyncio.Event()
         self._stop = False
 
-        # httpx client for REST instrument discovery
         self.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
-        # telegram
+        # Telegram
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
 
@@ -297,14 +253,11 @@ class DhanWebsocketTelegramBot:
         return f"{self.ws_base}{qs}"
 
     async def close(self):
-        # clean up
         try:
             await self.http_client.aclose()
         except Exception:
             pass
-        # persist cache
         try:
-            # transform latest_prices to str keys
             to_save = {"last_prices": {str(k): v for k, v in self.latest_prices.items() if v is not None}}
             save_cache(CACHE_FILE, to_save)
             logger.info(f"Saved cache {CACHE_FILE}")
@@ -321,71 +274,51 @@ class DhanWebsocketTelegramBot:
 
     async def fetch_and_update_instruments(self) -> bool:
         """
-        Fetch instruments via REST and update mapping.
-        Returns True if mapping changed (so caller should resubscribe).
+        Use CSV-based discovery to pick front-months and update mapping.
+        Returns True if mapping changed (then resubscribe).
         """
         changed = False
         try:
-            instruments = await fetch_instruments_rest(self.http_client, self.segment)
+            instruments = await fetch_instruments_from_csv(self.http_client)
             if not instruments:
-                logger.info("Instrument discovery returned empty (endpoint might be unavailable for this account).")
+                logger.info("Instrument discovery returned empty (CSV fetch failed or empty).")
                 return False
             new_mapping: Dict[str, int] = {}
             for cname, underlying in COMMODITY_UNDERLYINGS.items():
                 inst = pick_front_month(instruments, underlying)
                 if inst:
-                    # find id in common fields
                     sid = None
-                    for pk in ("id", "security_id", "instrument_token", "instrumentId"):
-                        if pk in inst and inst.get(pk) is not None:
+                    for pk in ("id", "security_id", "instrument_token", "token", "instrumentId", "contract_id"):
+                        if pk in inst and inst.get(pk):
                             try:
                                 sid = int(inst.get(pk))
                                 break
                             except Exception:
                                 continue
-                    # some APIs use 'token' or 'contract_id'
-                    if sid is None:
-                        for pk in ("token", "contract_id"):
-                            if pk in inst and inst.get(pk) is not None:
-                                try:
-                                    sid = int(inst.get(pk))
-                                    break
-                                except Exception:
-                                    continue
                     if sid is not None:
                         new_mapping[cname] = sid
                     else:
-                        logger.debug(f"No id found on instrument object for {cname}: {inst}")
-                        # fallback to existing mapping if available
+                        logger.debug(f"No numeric id found for {cname} in instrument row; keeping old mapping")
                         new_mapping[cname] = int(self.mapping.get(cname, INITIAL_SECURITY_IDS.get(cname)))
                 else:
-                    # not found: keep existing mapping
                     new_mapping[cname] = int(self.mapping.get(cname, INITIAL_SECURITY_IDS.get(cname)))
-            # compare
             if new_mapping != self.mapping:
                 logger.info(f"Instrument mapping changed: {self.mapping} -> {new_mapping}")
                 self.mapping = new_mapping
-                # update current security id list
                 self.current_security_ids = [int(v) for v in self.mapping.values()]
-                # ensure latest_prices has keys for new ids
                 for sid in self.current_security_ids:
                     if sid not in self.latest_prices:
                         self.latest_prices[sid] = None
                 changed = True
             else:
-                logger.debug("Instrument mapping unchanged.")
+                logger.debug("Instrument mapping unchanged after CSV discovery.")
         except Exception as e:
             logger.warning(f"Error during instrument discovery: {e}")
         return changed
 
     async def resubscribe_ws(self):
-        """
-        Signal that ws reconnect/resubscribe should happen.
-        We trigger a reconnect by setting event and closing websocket if open.
-        """
         logger.info("Triggering WS resubscribe/reconnect")
         self._reconnect.set()
-        # close current ws if exists
         async with self._ws_lock:
             if self._ws is not None:
                 try:
@@ -394,10 +327,6 @@ class DhanWebsocketTelegramBot:
                     pass
 
     async def _ws_worker(self):
-        """
-        WebSocket connect + read loop. Respects self.mapping for subscription ids.
-        If self._reconnect is set, triggers reconnection to subscribe new ids.
-        """
         backoff = INITIAL_BACKOFF
         while not self._stop:
             ws_url = self._build_ws_url()
@@ -408,10 +337,8 @@ class DhanWebsocketTelegramBot:
                     logger.info("WebSocket connected")
                     async with self._ws_lock:
                         self._ws = ws
-                        # ensure reconnect flag cleared
                         if self._reconnect.is_set():
                             self._reconnect.clear()
-                    # subscribe
                     subscribe_payload = {
                         "msgtype": "subscribe",
                         "exchange_segment": self.segment,
@@ -422,19 +349,15 @@ class DhanWebsocketTelegramBot:
                         logger.info(f"Subscribed: {subscribe_payload}")
                     except Exception as e:
                         logger.warning(f"Failed to send subscribe payload: {e}")
-
-                    # read loop
                     async for raw in ws:
                         if raw is None:
                             continue
-                        # log raw for debugging but keep it concise
                         logger.debug(f"WS RAW: {raw if len(str(raw)) < 1000 else str(raw)[:1000] + '...'}")
-                        # parse JSON
                         try:
                             obj = json.loads(raw)
                         except Exception:
                             continue
-                        # extract sid and price (per earlier patterns)
+                        # parse sid
                         sid = None
                         for k in ("security_id", "id", "instrument", "sec_id"):
                             if k in obj:
@@ -470,7 +393,7 @@ class DhanWebsocketTelegramBot:
                                             sid = int(tick[k])
                                         except Exception:
                                             pass
-                        # fallback nested mapping
+                        # nested fallback
                         if sid is None and isinstance(obj, dict):
                             for segk, segv in obj.items():
                                 if isinstance(segv, dict):
@@ -488,61 +411,50 @@ class DhanWebsocketTelegramBot:
                                             continue
                                 if sid is not None:
                                     break
-                        # update latest_prices with caution
+                        # update
                         if sid is not None and price is not None:
-                            # treat 0.0 as artifact/unavailable
                             if price == 0.0:
                                 logger.debug(f"Received 0.0 price for sid={sid}; storing as None")
                                 self.latest_prices[sid] = None
                             else:
                                 self.latest_prices[sid] = price
                                 logger.debug(f"Updated price sid={sid} -> {price}")
-                                # persist last-good price to cache file as we go (lightweight)
                                 try:
                                     to_save = {"last_prices": {str(k): v for k, v in self.latest_prices.items() if v is not None}}
                                     save_cache(CACHE_FILE, to_save)
                                 except Exception:
                                     pass
-                        # check if somebody requested resubscribe (mapping changed)
                         if self._reconnect.is_set():
-                            logger.info("Detected resubscribe request -> break to reconnect")
+                            logger.info("Resubscribe requested -> breaking read loop to reconnect")
                             break
-                    # end async for -> connection closed / break
-                    logger.info("WebSocket connection closed (read loop ended)")
+                    logger.info("WebSocket read loop ended")
                     async with self._ws_lock:
                         self._ws = None
-                    # reset backoff on normal close before reconnecting
                     backoff = INITIAL_BACKOFF
             except asyncio.CancelledError:
                 logger.info("WS worker cancelled")
                 break
             except Exception as e:
                 logger.warning(f"WebSocket connection error: {e}")
-                # exponential backoff then reconnect
                 logger.info(f"Reconnecting after {backoff:.1f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 continue
 
     async def periodic_refresh_worker(self):
-        """
-        Periodically refresh instruments and trigger resubscribe if mapping changed.
-        """
-        # initial immediate attempt to discover & update mapping
+        # initial immediate attempt
         try:
             changed = await self.fetch_and_update_instruments()
             if changed:
                 await self.resubscribe_ws()
         except Exception as e:
             logger.debug(f"Initial instruments refresh error: {e}")
-
         while not self._stop:
             try:
                 await asyncio.sleep(REFRESH_INTERVAL)
                 logger.info("Running periodic instruments refresh")
                 changed = await self.fetch_and_update_instruments()
                 if changed:
-                    # mapping changed -> resubscribe
                     await self.resubscribe_ws()
             except asyncio.CancelledError:
                 break
@@ -551,21 +463,14 @@ class DhanWebsocketTelegramBot:
                 continue
 
     async def periodic_sender_worker(self):
-        """
-        Send periodic Telegram summary using current mapping and latest_prices.
-        """
-        # initial startup message
         try:
             await self.send_telegram("✅ Bot started successfully!\n\n📊 You will receive commodity price updates every minute.")
         except Exception as e:
             logger.debug(f"Startup telegram message failed: {e}")
-
         while not self._stop:
             try:
-                # build and send summary
                 msg = format_telegram_message(self.latest_prices, self.prev_sent_prices, self.mapping)
                 await self.send_telegram(msg)
-                # update prev_sent_prices
                 for sid, val in list(self.latest_prices.items()):
                     if val is not None:
                         self.prev_sent_prices[sid] = val
@@ -577,9 +482,6 @@ class DhanWebsocketTelegramBot:
                 await asyncio.sleep(5)
 
     async def run(self):
-        """
-        Kick off workers: ws worker, refresh worker, sender worker.
-        """
         logger.info("Starting main run loop")
         ws_task = asyncio.create_task(self._ws_worker())
         refresh_task = asyncio.create_task(self.periodic_refresh_worker())
@@ -595,7 +497,7 @@ class DhanWebsocketTelegramBot:
                     pass
             await self.close()
 
-# ---------- Entrypoint ----------
+# Entrypoint
 if __name__ == "__main__":
     bot = DhanWebsocketTelegramBot()
     try:
