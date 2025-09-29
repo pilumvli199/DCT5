@@ -3,6 +3,7 @@ import os
 import asyncio
 import time
 from dhanhq import dhanhq
+from dhanhq import DhanEnv
 from telegram import Bot
 from telegram.error import TelegramError
 from datetime import datetime
@@ -23,11 +24,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Commodity symbols - MCX
 COMMODITIES = {
-    "GOLD": {"exchange": "MCX", "security_id": "114"},
-    "SILVER": {"exchange": "MCX", "security_id": "229"},
-    "CRUDE OIL": {"exchange": "MCX", "security_id": "236"},
-    "NATURAL GAS": {"exchange": "MCX", "security_id": "235"},
-    "COPPER": {"exchange": "MCX", "security_id": "256"}
+    "GOLD": {"exchange": dhanhq.MCX, "security_id": "114"},
+    "SILVER": {"exchange": dhanhq.MCX, "security_id": "229"},
+    "CRUDE OIL": {"exchange": dhanhq.MCX, "security_id": "236"},
+    "NATURAL GAS": {"exchange": dhanhq.MCX, "security_id": "235"},
+    "COPPER": {"exchange": dhanhq.MCX, "security_id": "256"}
 }
 
 class DhanTelegramBot:
@@ -35,7 +36,7 @@ class DhanTelegramBot:
         if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
             raise ValueError("Missing required environment variables!")
         
-        self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
+        self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
         self.last_prices = {}
@@ -44,13 +45,18 @@ class DhanTelegramBot:
     async def get_ltp(self, security_id, exchange):
         """Get Latest Traded Price from DhanHQ"""
         try:
-            quote = self.dhan.get_ltp_data(
+            # Version 2.x syntax
+            response = self.dhan.marketfeed.get_ltp(
                 exchange_segment=exchange,
                 security_id=security_id
             )
-            if quote and 'data' in quote:
-                ltp = quote['data'].get('LTP', 0)
-                return ltp
+            
+            if response and 'data' in response:
+                ltp_data = response['data']
+                if isinstance(ltp_data, dict):
+                    return ltp_data.get('LTP')
+                elif isinstance(ltp_data, list) and len(ltp_data) > 0:
+                    return ltp_data[0].get('LTP')
             return None
         except Exception as e:
             logger.error(f"Error fetching LTP for {security_id}: {e}")
