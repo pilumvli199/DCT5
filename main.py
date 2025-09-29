@@ -3,7 +3,6 @@ import os
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime
 from typing import Dict, Optional, List
 
@@ -11,14 +10,14 @@ import websockets  # pip install websockets
 from telegram import Bot
 from telegram.error import TelegramError
 
-# ---------- logging ----------
+# ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("dhan-telegram-ws")
 
-# ---------- env ----------
+# ---------- Environment ----------
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -29,10 +28,10 @@ if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT
     raise SystemExit("Missing required environment variables")
 
 # ---------- WebSocket endpoint & config ----------
-WS_URL = "wss://api-feed.dhan.co"  # DhanHQ websocket endpoint (as used earlier)
-MCX_SEGMENT = "MCX_COMM"  # exchange segment to subscribe for MCX commodities
+WS_URL = "wss://api-feed.dhan.co"  # change if your account uses a different WS URL
+MCX_SEGMENT = "MCX_COMM"
 
-# Commodities mapping with security IDs (as you provided)
+# Commodities mapping with security IDs
 COMMODITIES = {
     "GOLD": 114,
     "SILVER": 229,
@@ -41,17 +40,16 @@ COMMODITIES = {
     "COPPER": 256,
 }
 
-# subscribe list for websocket (integers)
 SECURITY_IDS: List[int] = [int(v) for v in COMMODITIES.values()]
 
-# Backoff config for reconnects
+# Backoff config
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
 
 # Telegram send interval (seconds)
 SEND_INTERVAL = 60
 
-# ---------- Helper functions ----------
+# ---------- Helpers ----------
 def _safe_float(v) -> Optional[float]:
     try:
         if v is None:
@@ -65,7 +63,6 @@ def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[
     msg = f"📊 *Commodity Prices*\n"
     msg += f"🕒 {timestamp}\n"
     msg += "━━━━━━━━━━━━━━━━\n\n"
-    # iterate in same order as COMMODITIES dict
     for name, sid in COMMODITIES.items():
         price = latest.get(sid)
         if price is None:
@@ -85,7 +82,7 @@ def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[
     msg += "━━━━━━━━━━━━━━━━"
     return msg
 
-# ---------- Main bot class ----------
+# ---------- Main Bot ----------
 class DhanWebsocketTelegramBot:
     def __init__(self):
         self.ws_url = WS_URL
@@ -94,9 +91,8 @@ class DhanWebsocketTelegramBot:
         self.segment = MCX_SEGMENT
         self.security_ids = SECURITY_IDS
 
-        # storage for latest prices {security_id: price}
+        # price storage
         self.latest_prices: Dict[int, Optional[float]] = {sid: None for sid in self.security_ids}
-        # previously sent prices for change calculation
         self.prev_sent_prices: Dict[int, Optional[float]] = {}
 
         # telegram
@@ -110,11 +106,8 @@ class DhanWebsocketTelegramBot:
 
     async def start(self):
         logger.info("Starting Dhan WebSocket -> Telegram bot")
-        # run websocket listener and sender concurrently
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._sender_task = asyncio.create_task(self._periodic_sender())
-
-        # wait for tasks (they run until cancelled)
         await asyncio.gather(self._ws_task, self._sender_task)
 
     async def stop(self):
@@ -126,15 +119,14 @@ class DhanWebsocketTelegramBot:
             self._sender_task.cancel()
 
     async def _periodic_sender(self):
-        # Wait a bit for initial prices to populate
+        # Give a moment to populate initial prices
         await asyncio.sleep(2)
         while not self._stop:
             try:
-                # build message from latest_prices and prev_sent_prices
                 message = format_telegram_message(self.latest_prices, self.prev_sent_prices)
                 await self._send_telegram(message)
-                # update prev_sent_prices only for non-None values
-                for sid, val in list(self.latest_prices.items()):
+                # update prev_sent_prices for non-None
+                for sid, val in self.latest_prices.items():
                     if val is not None:
                         self.prev_sent_prices[sid] = val
                 await asyncio.sleep(SEND_INTERVAL)
@@ -155,31 +147,150 @@ class DhanWebsocketTelegramBot:
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
 
+    # ---------- Robust WS loop (replace previous simpler loop) ----------
     async def _ws_loop(self):
+        """
+        Try multiple handshake variants:
+         - header tuples
+         - header dict
+         - Authorization: Bearer
+         - query params
+         - with Origin header
+         - with simple subprotocols
+         - plain connect
+        Logs attempts and errors. Subscribes and parses incoming ticks.
+        """
         backoff = INITIAL_BACKOFF
-        while not self._stop:
-            try:
-                # connect with headers
-                headers = [
-                    ("client-id", self.client_id),
-                    ("access-token", self.access_token)
-                ]
-                logger.info(f"Connecting to WS {self.ws_url} (subscribe {self.security_ids})")
-                async with websockets.connect(self.ws_url, extra_headers=headers, ping_interval=20, ping_timeout=10) as ws:
-                    logger.info("WebSocket connected")
-                    backoff = INITIAL_BACKOFF  # reset backoff after successful connect
+        attempt_num = 0
 
-                    # send subscribe message (protocol used earlier)
+        async def try_connect(ws_url, connect_kwargs, attempt_label):
+            nonlocal attempt_num
+            attempt_num += 1
+            # hide access token in logs but show label
+            log_kwargs = {k: ("<hidden>" if k == "extra_headers" else str(connect_kwargs.get(k))) for k in connect_kwargs}
+            logger.info(f"WS attempt #{attempt_num}: {attempt_label} -> {ws_url} kwargs={list(connect_kwargs.keys())}")
+            try:
+                # websockets.connect accepts extra_headers as list or dict
+                return await websockets.connect(ws_url, **connect_kwargs)
+            except Exception as e:
+                logger.error(f"WebSocket attempt #{attempt_num} ({attempt_label}) error: {e}")
+                raise
+
+        while not self._stop:
+            # prepare handshake variants
+            variants = []
+
+            # 1) header-based tuples
+            variants.append({
+                "label": "headers-tuples",
+                "url": self.ws_url,
+                "kwargs": {
+                    "extra_headers": [("client-id", self.client_id), ("access-token", self.access_token)],
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 2) header-based dict
+            variants.append({
+                "label": "headers-dict",
+                "url": self.ws_url,
+                "kwargs": {
+                    "extra_headers": {"client-id": self.client_id, "access-token": self.access_token},
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 3) Authorization Bearer
+            variants.append({
+                "label": "authorization-bearer",
+                "url": self.ws_url,
+                "kwargs": {
+                    "extra_headers": {"Authorization": f"Bearer {self.access_token}", "client-id": self.client_id},
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 4) query params
+            qp_url = f"{self.ws_url}?client_id={self.client_id}&access_token={self.access_token}"
+            variants.append({
+                "label": "query-params",
+                "url": qp_url,
+                "kwargs": {
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 5) origin + header tuples
+            variants.append({
+                "label": "headers-with-origin",
+                "url": self.ws_url,
+                "kwargs": {
+                    "extra_headers": [("client-id", self.client_id), ("access-token", self.access_token), ("Origin", "https://api.dhan.co")],
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 6) subprotocols + headers
+            variants.append({
+                "label": "subprotocol-json-headers",
+                "url": self.ws_url,
+                "kwargs": {
+                    "extra_headers": {"client-id": self.client_id, "access-token": self.access_token},
+                    "subprotocols": ["json"],
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+            # 7) plain connect (no headers) - to inspect server response
+            variants.append({
+                "label": "plain-no-headers",
+                "url": self.ws_url,
+                "kwargs": {
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+            })
+
+            connected = False
+            ws = None
+
+            for v in variants:
+                try:
+                    ws = await try_connect(v["url"], v["kwargs"], v["label"])
+                    # if connection returned, wrap in context manager style usage below
+                    connected = True
+                    logger.info(f"Connected using variant: {v['label']}")
+                    break
+                except Exception:
+                    # slight pause before next variant
+                    await asyncio.sleep(0.25)
+                    continue
+
+            if not connected:
+                logger.info(f"All WS handshake variants failed. Reconnecting after {backoff:.1f}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+
+            # we have a WebSocket connection object (ws). Use it in async-with pattern
+            try:
+                async with ws as socket:
+                    backoff = INITIAL_BACKOFF  # reset backoff on successful connect
+
+                    # subscribe
                     subscribe_payload = {
                         "msgtype": "subscribe",
                         "exchange_segment": self.segment,
                         "security_ids": self.security_ids
                     }
-                    await ws.send(json.dumps(subscribe_payload))
-                    logger.info(f"Subscribed: {subscribe_payload}")
+                    try:
+                        await socket.send(json.dumps(subscribe_payload))
+                        logger.info(f"Subscribed with payload: {subscribe_payload}")
+                    except Exception as e:
+                        logger.error(f"Failed to send subscribe payload: {e}")
 
-                    # receive loop
-                    async for raw in ws:
+                    # read loop
+                    async for raw in socket:
                         if raw is None:
                             continue
                         try:
@@ -188,10 +299,8 @@ class DhanWebsocketTelegramBot:
                             logger.debug(f"Received non-json WS message: {raw}")
                             continue
 
-                        # parse known tick shapes - be permissive
-                        # sample expected keys: 'security_id', 'last_price', 'ltp', 'lastTradedPrice'
+                        # parse sid
                         sid = None
-                        # try multiple key names
                         for k in ("security_id", "id", "instrument", "sec_id"):
                             if k in obj:
                                 try:
@@ -199,28 +308,25 @@ class DhanWebsocketTelegramBot:
                                     break
                                 except Exception:
                                     pass
-                        # if no direct key, maybe nested under 'data' etc.
+
                         if sid is None and isinstance(obj.get("data"), dict):
-                            # try to find a numeric key
                             data = obj.get("data")
                             for kk, vv in data.items():
                                 try:
                                     ss = int(kk)
                                     sid = ss
-                                    # set obj to vv for price extraction
                                     obj = vv if isinstance(vv, dict) else obj
                                     break
                                 except Exception:
                                     continue
 
-                        # get price fields
+                        # parse price
                         price = None
                         for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
                             if price_key in obj:
                                 price = _safe_float(obj.get(price_key))
                                 break
 
-                        # sometimes payload is like {"tick": {...}}
                         if price is None and "tick" in obj and isinstance(obj["tick"], dict):
                             tick = obj["tick"]
                             for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
@@ -235,14 +341,13 @@ class DhanWebsocketTelegramBot:
                                         except Exception:
                                             pass
 
-                        # fallback: if msg contains mapping of segment -> id -> {last_price:..}
+                        # fallback nested segment/id mapping
                         if sid is None and isinstance(obj, dict):
                             for segk, segv in obj.items():
                                 if isinstance(segv, dict):
                                     for idk, idv in segv.items():
                                         try:
                                             ss = int(idk)
-                                            # idv may contain price
                                             for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
                                                 if isinstance(idv, dict) and price_key in idv:
                                                     price = _safe_float(idv.get(price_key))
@@ -255,26 +360,22 @@ class DhanWebsocketTelegramBot:
                                 if sid is not None:
                                     break
 
-                        # if we got sid and price, update
                         if sid is not None and price is not None:
-                            # update only if non-zero meaningful price; keep None for missing/0
                             if price == 0.0:
-                                # treat 0.0 as unavailable artifact (you can change this)
                                 logger.debug(f"Received 0.0 price for sid={sid}; treating as unavailable")
                                 self.latest_prices[sid] = None
                             else:
                                 self.latest_prices[sid] = price
                                 logger.debug(f"Updated price sid={sid} price={price}")
                         else:
-                            # log for debugging occasionally
                             logger.debug(f"WS msg no price parsed: {obj}")
 
             except asyncio.CancelledError:
                 logger.info("Websocket loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"WebSocket connection error: {e}")
-                # backoff before reconnect
+                logger.error(f"WebSocket read loop error after connect: {e}")
+                # wait and reconnect with backoff
                 logger.info(f"Reconnecting after {backoff:.1f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
