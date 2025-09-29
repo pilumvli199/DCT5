@@ -2,8 +2,8 @@
 import os
 import asyncio
 import time
-from dhanhq import dhanhq
-from dhanhq import DhanEnv
+from dhanhq import dhanhq  # keep this — your code already uses dhanhq(...)
+# NOTE: removed "from dhanhq import DhanEnv" because that import doesn't exist in installed package
 from telegram import Bot
 from telegram.error import TelegramError
 from datetime import datetime
@@ -23,12 +23,24 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Commodity symbols - MCX
+# Keep using the dhanhq constants if available; fall back safely if not.
+def _get_exchange_constant(module, name):
+    # try module.NAME, then module.Exchange.NAME
+    if hasattr(module, name):
+        return getattr(module, name)
+    exch = getattr(module, "Exchange", None)
+    if exch and hasattr(exch, name):
+        return getattr(exch, name)
+    return name  # fallback to raw name; the package might accept string in some apis
+
+MCX_CONST = _get_exchange_constant(dhanhq, "MCX")
+
 COMMODITIES = {
-    "GOLD": {"exchange": dhanhq.MCX, "security_id": "114"},
-    "SILVER": {"exchange": dhanhq.MCX, "security_id": "229"},
-    "CRUDE OIL": {"exchange": dhanhq.MCX, "security_id": "236"},
-    "NATURAL GAS": {"exchange": dhanhq.MCX, "security_id": "235"},
-    "COPPER": {"exchange": dhanhq.MCX, "security_id": "256"}
+    "GOLD": {"exchange": MCX_CONST, "security_id": "114"},
+    "SILVER": {"exchange": MCX_CONST, "security_id": "229"},
+    "CRUDE OIL": {"exchange": MCX_CONST, "security_id": "236"},
+    "NATURAL GAS": {"exchange": MCX_CONST, "security_id": "235"},
+    "COPPER": {"exchange": MCX_CONST, "security_id": "256"}
 }
 
 class DhanTelegramBot:
@@ -36,6 +48,8 @@ class DhanTelegramBot:
         if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
             raise ValueError("Missing required environment variables!")
         
+        # instantiate dhanhq client
+        # many dhanhq versions accept (client_id, access_token) or a dict — you already used this pattern
         self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
@@ -45,23 +59,41 @@ class DhanTelegramBot:
     async def get_ltp(self, security_id, exchange):
         """Get Latest Traded Price from DhanHQ"""
         try:
-            # Version 2.x syntax
-            response = self.dhan.marketfeed.get_ltp(
-                exchange_segment=exchange,
-                security_id=security_id
-            )
-            
-            if response and 'data' in response:
+            # Version-agnostic attempt: try common method names / argument names
+            # Primary attempt: marketfeed.get_ltp(exchange_segment=..., security_id=...)
+            # If that fails, try get_ltp(exchange=..., token=..., id=...)
+            response = None
+            try:
+                response = self.dhan.marketfeed.get_ltp(
+                    exchange_segment=exchange,
+                    security_id=security_id
+                )
+            except Exception:
+                # second attempt with alternate arg names
+                response = self.dhan.marketfeed.get_ltp(
+                    exchange=exchange,
+                    security_id=security_id
+                )
+            # response may be dict or object; handle common shapes
+            if response is None:
+                return None
+            if isinstance(response, dict) and 'data' in response:
                 ltp_data = response['data']
                 if isinstance(ltp_data, dict):
-                    return ltp_data.get('LTP')
+                    return _safe_float(ltp_data.get('LTP'))
                 elif isinstance(ltp_data, list) and len(ltp_data) > 0:
-                    return ltp_data[0].get('LTP')
+                    return _safe_float(ltp_data[0].get('LTP'))
+            # sometimes the client returns the LTP directly or under different key
+            if isinstance(response, dict) and 'LTP' in response:
+                return _safe_float(response.get('LTP'))
+            # lastly, if response is a number
+            if isinstance(response, (int, float)):
+                return float(response)
             return None
         except Exception as e:
             logger.error(f"Error fetching LTP for {security_id}: {e}")
             return None
-    
+
     async def format_message(self, prices):
         """Format price message for Telegram"""
         timestamp = datetime.now().strftime("%d-%m-%Y %I:%M %p")
@@ -74,7 +106,7 @@ class DhanTelegramBot:
             if data['price'] is not None:
                 # Calculate change
                 change = ""
-                if commodity in self.last_prices and self.last_prices[commodity]:
+                if commodity in self.last_prices and self.last_prices[commodity] is not None:
                     diff = data['price'] - self.last_prices[commodity]
                     if diff > 0:
                         change = f"📈 +{diff:.2f}"
@@ -85,6 +117,9 @@ class DhanTelegramBot:
                 
                 message += f"*{commodity}*\n"
                 message += f"₹ {data['price']:.2f} {change}\n\n"
+            else:
+                message += f"*{commodity}*\n"
+                message += f"_Price unavailable_\n\n"
         
         message += "━━━━━━━━━━━━━━━━"
         return message
@@ -92,6 +127,7 @@ class DhanTelegramBot:
     async def send_telegram_message(self, message):
         """Send message to Telegram"""
         try:
+            # python-telegram-bot v20 Bot.send_message is a coroutine (awaitable)
             await self.telegram_bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
@@ -155,6 +191,14 @@ class DhanTelegramBot:
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
                 await asyncio.sleep(60)
+
+def _safe_float(val):
+    try:
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
 
 # Run the bot
 if __name__ == "__main__":
