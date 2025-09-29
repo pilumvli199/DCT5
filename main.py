@@ -35,7 +35,7 @@ class DhanTelegramBot:
         if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
             raise ValueError("Missing required environment variables!")
         
-        self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+        self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
         self.last_prices = {}
