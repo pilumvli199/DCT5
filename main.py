@@ -27,8 +27,11 @@ if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT
     logger.error("Missing env vars. Set DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
     raise SystemExit("Missing required environment variables")
 
-# ---------- WebSocket endpoint & config ----------
-WS_URL = "wss://api-feed.dhan.co"  # change if your account uses a different WS URL
+# ---------- WebSocket base & config ----------
+WS_BASE = "wss://api-feed.dhan.co"  # base (we will append query string per docs)
+# Per Dhan docs for v2: must include version=2, token, clientId, authType=2
+WS_QUERY_TEMPLATE = "?version=2&token={token}&clientId={clientId}&authType=2"
+
 MCX_SEGMENT = "MCX_COMM"
 
 # Commodities mapping with security IDs
@@ -46,7 +49,7 @@ SECURITY_IDS: List[int] = [int(v) for v in COMMODITIES.values()]
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
 
-# Telegram send interval (seconds)
+# Telegram interval
 SEND_INTERVAL = 60
 
 # ---------- Helpers ----------
@@ -82,30 +85,33 @@ def format_telegram_message(latest: Dict[int, Optional[float]], prev_sent: Dict[
     msg += "━━━━━━━━━━━━━━━━"
     return msg
 
-# ---------- Main Bot ----------
+# ---------- Bot ----------
 class DhanWebsocketTelegramBot:
     def __init__(self):
-        self.ws_url = WS_URL
+        self.ws_base = WS_BASE
+        self.token = DHAN_ACCESS_TOKEN
         self.client_id = str(DHAN_CLIENT_ID)
-        self.access_token = str(DHAN_ACCESS_TOKEN)
         self.segment = MCX_SEGMENT
         self.security_ids = SECURITY_IDS
 
-        # price storage
         self.latest_prices: Dict[int, Optional[float]] = {sid: None for sid in self.security_ids}
         self.prev_sent_prices: Dict[int, Optional[float]] = {}
 
-        # telegram
+        # Telegram
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
 
-        # control
         self._stop = False
         self._ws_task: Optional[asyncio.Task] = None
         self._sender_task: Optional[asyncio.Task] = None
 
+    def _build_ws_url(self) -> str:
+        # build URL with required query params per Dhan docs
+        qs = WS_QUERY_TEMPLATE.format(token=self.token, clientId=self.client_id)
+        return f"{self.ws_base}{qs}"
+
     async def start(self):
-        logger.info("Starting Dhan WebSocket -> Telegram bot")
+        logger.info("Starting Dhan WebSocket -> Telegram bot (query-param handshake)")
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._sender_task = asyncio.create_task(self._periodic_sender())
         await asyncio.gather(self._ws_task, self._sender_task)
@@ -119,13 +125,12 @@ class DhanWebsocketTelegramBot:
             self._sender_task.cancel()
 
     async def _periodic_sender(self):
-        # Give a moment to populate initial prices
         await asyncio.sleep(2)
         while not self._stop:
             try:
                 message = format_telegram_message(self.latest_prices, self.prev_sent_prices)
                 await self._send_telegram(message)
-                # update prev_sent_prices for non-None
+                # update prev_sent_prices
                 for sid, val in self.latest_prices.items():
                     if val is not None:
                         self.prev_sent_prices[sid] = val
@@ -147,156 +152,34 @@ class DhanWebsocketTelegramBot:
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
 
-    # ---------- Robust WS loop (replace previous simpler loop) ----------
     async def _ws_loop(self):
-        """
-        Try multiple handshake variants:
-         - header tuples
-         - header dict
-         - Authorization: Bearer
-         - query params
-         - with Origin header
-         - with simple subprotocols
-         - plain connect
-        Logs attempts and errors. Subscribes and parses incoming ticks.
-        """
         backoff = INITIAL_BACKOFF
-        attempt_num = 0
-
-        async def try_connect(ws_url, connect_kwargs, attempt_label):
-            nonlocal attempt_num
-            attempt_num += 1
-            # hide access token in logs but show label
-            log_kwargs = {k: ("<hidden>" if k == "extra_headers" else str(connect_kwargs.get(k))) for k in connect_kwargs}
-            logger.info(f"WS attempt #{attempt_num}: {attempt_label} -> {ws_url} kwargs={list(connect_kwargs.keys())}")
-            try:
-                # websockets.connect accepts extra_headers as list or dict
-                return await websockets.connect(ws_url, **connect_kwargs)
-            except Exception as e:
-                logger.error(f"WebSocket attempt #{attempt_num} ({attempt_label}) error: {e}")
-                raise
-
         while not self._stop:
-            # prepare handshake variants
-            variants = []
-
-            # 1) header-based tuples
-            variants.append({
-                "label": "headers-tuples",
-                "url": self.ws_url,
-                "kwargs": {
-                    "extra_headers": [("client-id", self.client_id), ("access-token", self.access_token)],
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 2) header-based dict
-            variants.append({
-                "label": "headers-dict",
-                "url": self.ws_url,
-                "kwargs": {
-                    "extra_headers": {"client-id": self.client_id, "access-token": self.access_token},
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 3) Authorization Bearer
-            variants.append({
-                "label": "authorization-bearer",
-                "url": self.ws_url,
-                "kwargs": {
-                    "extra_headers": {"Authorization": f"Bearer {self.access_token}", "client-id": self.client_id},
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 4) query params
-            qp_url = f"{self.ws_url}?client_id={self.client_id}&access_token={self.access_token}"
-            variants.append({
-                "label": "query-params",
-                "url": qp_url,
-                "kwargs": {
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 5) origin + header tuples
-            variants.append({
-                "label": "headers-with-origin",
-                "url": self.ws_url,
-                "kwargs": {
-                    "extra_headers": [("client-id", self.client_id), ("access-token", self.access_token), ("Origin", "https://api.dhan.co")],
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 6) subprotocols + headers
-            variants.append({
-                "label": "subprotocol-json-headers",
-                "url": self.ws_url,
-                "kwargs": {
-                    "extra_headers": {"client-id": self.client_id, "access-token": self.access_token},
-                    "subprotocols": ["json"],
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-            # 7) plain connect (no headers) - to inspect server response
-            variants.append({
-                "label": "plain-no-headers",
-                "url": self.ws_url,
-                "kwargs": {
-                    "ping_interval": 20,
-                    "ping_timeout": 10,
-                }
-            })
-
-            connected = False
-            ws = None
-
-            for v in variants:
-                try:
-                    ws = await try_connect(v["url"], v["kwargs"], v["label"])
-                    # if connection returned, wrap in context manager style usage below
-                    connected = True
-                    logger.info(f"Connected using variant: {v['label']}")
-                    break
-                except Exception:
-                    # slight pause before next variant
-                    await asyncio.sleep(0.25)
-                    continue
-
-            if not connected:
-                logger.info(f"All WS handshake variants failed. Reconnecting after {backoff:.1f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, MAX_BACKOFF)
-                continue
-
-            # we have a WebSocket connection object (ws). Use it in async-with pattern
+            ws_url = self._build_ws_url()
+            # Do not log token (sensitive); log only masked
+            masked = f"{self.ws_base}?version=2&token=<hidden>&clientId={self.client_id}&authType=2"
+            logger.info(f"Connecting to WS {masked} (subscribe {self.security_ids})")
             try:
-                async with ws as socket:
-                    backoff = INITIAL_BACKOFF  # reset backoff on successful connect
+                async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("WebSocket connected (query-param auth)")
+                    backoff = INITIAL_BACKOFF  # reset
 
-                    # subscribe
+                    # subscribe message (same as before)
                     subscribe_payload = {
                         "msgtype": "subscribe",
                         "exchange_segment": self.segment,
                         "security_ids": self.security_ids
                     }
-                    try:
-                        await socket.send(json.dumps(subscribe_payload))
-                        logger.info(f"Subscribed with payload: {subscribe_payload}")
-                    except Exception as e:
-                        logger.error(f"Failed to send subscribe payload: {e}")
+                    await ws.send(json.dumps(subscribe_payload))
+                    logger.info(f"Subscribed: {subscribe_payload}")
 
-                    # read loop
-                    async for raw in socket:
+                    async for raw in ws:
                         if raw is None:
                             continue
                         try:
                             obj = json.loads(raw)
                         except Exception:
-                            logger.debug(f"Received non-json WS message: {raw}")
+                            logger.debug(f"Non-json WS message: {raw}")
                             continue
 
                         # parse sid
@@ -341,7 +224,7 @@ class DhanWebsocketTelegramBot:
                                         except Exception:
                                             pass
 
-                        # fallback nested segment/id mapping
+                        # fallback nested
                         if sid is None and isinstance(obj, dict):
                             for segk, segv in obj.items():
                                 if isinstance(segv, dict):
@@ -371,11 +254,10 @@ class DhanWebsocketTelegramBot:
                             logger.debug(f"WS msg no price parsed: {obj}")
 
             except asyncio.CancelledError:
-                logger.info("Websocket loop cancelled")
+                logger.info("WebSocket loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"WebSocket read loop error after connect: {e}")
-                # wait and reconnect with backoff
+                logger.error(f"WebSocket connection error: {e}")
                 logger.info(f"Reconnecting after {backoff:.1f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
