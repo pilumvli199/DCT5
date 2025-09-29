@@ -6,11 +6,12 @@ import logging
 from datetime import datetime
 from typing import Dict, Optional, List
 
-import websockets  # pip install websockets
+import websockets
 from telegram import Bot
 from telegram.error import TelegramError
 
 # ---------- Logging ----------
+# Keep INFO so logs show in Railway; we explicitly log WS raw lines at INFO
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -27,11 +28,9 @@ if not all([DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT
     logger.error("Missing env vars. Set DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
     raise SystemExit("Missing required environment variables")
 
-# ---------- WebSocket base & config ----------
-WS_BASE = "wss://api-feed.dhan.co"  # base (we will append query string per docs)
-# Per Dhan docs for v2: must include version=2, token, clientId, authType=2
+# ---------- WS config ----------
+WS_BASE = "wss://api-feed.dhan.co"
 WS_QUERY_TEMPLATE = "?version=2&token={token}&clientId={clientId}&authType=2"
-
 MCX_SEGMENT = "MCX_COMM"
 
 # Commodities mapping with security IDs
@@ -42,15 +41,14 @@ COMMODITIES = {
     "NATURAL GAS": 235,
     "COPPER": 256,
 }
-
 SECURITY_IDS: List[int] = [int(v) for v in COMMODITIES.values()]
 
-# Backoff config
+# Backoff
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
 
-# Telegram interval
-SEND_INTERVAL = 60
+# Telegram send interval (seconds)
+SEND_INTERVAL = int(os.getenv("SEND_INTERVAL", "60"))
 
 # ---------- Helpers ----------
 def _safe_float(v) -> Optional[float]:
@@ -97,7 +95,6 @@ class DhanWebsocketTelegramBot:
         self.latest_prices: Dict[int, Optional[float]] = {sid: None for sid in self.security_ids}
         self.prev_sent_prices: Dict[int, Optional[float]] = {}
 
-        # Telegram
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.chat_id = TELEGRAM_CHAT_ID
 
@@ -105,8 +102,10 @@ class DhanWebsocketTelegramBot:
         self._ws_task: Optional[asyncio.Task] = None
         self._sender_task: Optional[asyncio.Task] = None
 
+        # If we parsed and sent at least one immediate update, set this True
+        self._sent_first_tick = False
+
     def _build_ws_url(self) -> str:
-        # build URL with required query params per Dhan docs
         qs = WS_QUERY_TEMPLATE.format(token=self.token, clientId=self.client_id)
         return f"{self.ws_base}{qs}"
 
@@ -125,12 +124,13 @@ class DhanWebsocketTelegramBot:
             self._sender_task.cancel()
 
     async def _periodic_sender(self):
+        # Wait a small bit to allow initial immediate update
         await asyncio.sleep(2)
         while not self._stop:
             try:
                 message = format_telegram_message(self.latest_prices, self.prev_sent_prices)
                 await self._send_telegram(message)
-                # update prev_sent_prices
+                # update prev_sent_prices for non-None values
                 for sid, val in self.latest_prices.items():
                     if val is not None:
                         self.prev_sent_prices[sid] = val
@@ -156,34 +156,44 @@ class DhanWebsocketTelegramBot:
         backoff = INITIAL_BACKOFF
         while not self._stop:
             ws_url = self._build_ws_url()
-            # Do not log token (sensitive); log only masked
             masked = f"{self.ws_base}?version=2&token=<hidden>&clientId={self.client_id}&authType=2"
             logger.info(f"Connecting to WS {masked} (subscribe {self.security_ids})")
             try:
                 async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
                     logger.info("WebSocket connected (query-param auth)")
-                    backoff = INITIAL_BACKOFF  # reset
+                    backoff = INITIAL_BACKOFF
 
-                    # subscribe message (same as before)
+                    # Subscribe
                     subscribe_payload = {
                         "msgtype": "subscribe",
                         "exchange_segment": self.segment,
                         "security_ids": self.security_ids
                     }
-                    await ws.send(json.dumps(subscribe_payload))
-                    logger.info(f"Subscribed: {subscribe_payload}")
+                    try:
+                        await ws.send(json.dumps(subscribe_payload))
+                        logger.info(f"Subscribed: {subscribe_payload}")
+                    except Exception as e:
+                        logger.error(f"Failed to send subscribe payload: {e}")
 
+                    # Read loop
                     async for raw in ws:
                         if raw is None:
                             continue
+
+                        # Log raw message at INFO so you can paste it directly
+                        # (this is the key debug addition)
+                        logger.info(f"WS RAW: {raw}")
+
+                        # Try parse JSON
                         try:
                             obj = json.loads(raw)
                         except Exception:
-                            logger.debug(f"Non-json WS message: {raw}")
+                            logger.debug("Received non-json WS message, skipping parse")
                             continue
 
-                        # parse sid
+                        # ---- try to extract sid and price ----
                         sid = None
+                        # direct keys
                         for k in ("security_id", "id", "instrument", "sec_id"):
                             if k in obj:
                                 try:
@@ -192,6 +202,7 @@ class DhanWebsocketTelegramBot:
                                 except Exception:
                                     pass
 
+                        # nested under 'data'
                         if sid is None and isinstance(obj.get("data"), dict):
                             data = obj.get("data")
                             for kk, vv in data.items():
@@ -203,16 +214,17 @@ class DhanWebsocketTelegramBot:
                                 except Exception:
                                     continue
 
-                        # parse price
+                        # find price in many possible keys
                         price = None
-                        for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                        for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP", "lastTraded"):
                             if price_key in obj:
                                 price = _safe_float(obj.get(price_key))
                                 break
 
+                        # check nested 'tick'
                         if price is None and "tick" in obj and isinstance(obj["tick"], dict):
                             tick = obj["tick"]
-                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP", "lastTraded"):
                                 if price_key in tick:
                                     price = _safe_float(tick.get(price_key))
                                     break
@@ -224,14 +236,14 @@ class DhanWebsocketTelegramBot:
                                         except Exception:
                                             pass
 
-                        # fallback nested
+                        # fallback: nested segment/id mapping
                         if sid is None and isinstance(obj, dict):
                             for segk, segv in obj.items():
                                 if isinstance(segv, dict):
                                     for idk, idv in segv.items():
                                         try:
                                             ss = int(idk)
-                                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP"):
+                                            for price_key in ("last_price", "lastTradedPrice", "lastPrice", "ltp", "LTP", "lastTraded"):
                                                 if isinstance(idv, dict) and price_key in idv:
                                                     price = _safe_float(idv.get(price_key))
                                                     sid = ss
@@ -243,15 +255,31 @@ class DhanWebsocketTelegramBot:
                                 if sid is not None:
                                     break
 
+                        # if parsed price & sid, update
                         if sid is not None and price is not None:
                             if price == 0.0:
-                                logger.debug(f"Received 0.0 price for sid={sid}; treating as unavailable")
+                                # treat 0.0 as artifact/unavailable
                                 self.latest_prices[sid] = None
+                                logger.debug(f"Parsed price 0.0 for sid={sid}; stored as None")
                             else:
                                 self.latest_prices[sid] = price
-                                logger.debug(f"Updated price sid={sid} price={price}")
+                                logger.debug(f"Parsed price sid={sid} -> {price}")
+
+                                # send immediate Telegram on first successful parse (fast feedback)
+                                if not self._sent_first_tick:
+                                    self._sent_first_tick = True
+                                    try:
+                                        # send immediate summary
+                                        msg = format_telegram_message(self.latest_prices, self.prev_sent_prices)
+                                        await self._send_telegram(msg)
+                                        # update prev_sent_prices for non-None
+                                        for s, v in self.latest_prices.items():
+                                            if v is not None:
+                                                self.prev_sent_prices[s] = v
+                                    except Exception as e:
+                                        logger.error(f"Failed to send immediate Telegram: {e}")
                         else:
-                            logger.debug(f"WS msg no price parsed: {obj}")
+                            logger.debug("WS message did not contain usable sid+price")
 
             except asyncio.CancelledError:
                 logger.info("WebSocket loop cancelled")
@@ -263,7 +291,7 @@ class DhanWebsocketTelegramBot:
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 continue
 
-# ---------- Entrypoint ----------
+# Entrypoint
 if __name__ == "__main__":
     bot = DhanWebsocketTelegramBot()
     try:
